@@ -40,3 +40,5 @@ assert names == ["get_message","list_allowed_folders","list_messages","search_me
 assert set(tools[0].input_schema.get("properties",{})) or True
 print({t.name: list(t.input_schema.get("properties",{})) for t in tools})
 print("ALL TESTS PASSED")
+assert "list_allowed_folders first" in (server.mcp.instructions or "")
+print("INSTRUCTIONS OK")
