@@ -46,6 +46,9 @@ LIST_RESPONSE = [
     b'(\\HasNoChildren \\Drafts) "/" "Draft"',
     b'(\\HasNoChildren) "/" "' + server.mutf7_encode("חשבוניות").encode() + b'"',
 ]
+LIST_SPECIAL_USE = None  # set to a LIST response to simulate RFC 6154 servers
+CAPS = ("IMAP4REV1",)
+MESSAGES = {}  # uid -> raw message; default RAW
 calls = []
 
 
@@ -53,6 +56,14 @@ class FakeIMAP:
     def __init__(self, host, port, ssl_context, timeout):
         assert ssl_context.verify_mode.name == "CERT_REQUIRED" and ssl_context.check_hostname
         self.literal = None
+        self.capabilities = CAPS
+
+    def _simple_command(self, *args):
+        calls.append(("cmd",) + args)
+        return "OK", [b""]
+
+    def _untagged_response(self, typ, data, name):
+        return "OK", LIST_SPECIAL_USE
 
     def login(self, u, p): calls.append(("login", u))
     def select(self, f, readonly): calls.append(("select", f, readonly)); return "OK", [b"1"]
@@ -63,7 +74,8 @@ class FakeIMAP:
         calls.append(("uid", cmd, a, self.literal))
         if cmd == "SEARCH":
             return "OK", [b"3 7"]
-        return "OK", [(b"x", RAW)]
+        uid = int(a[0])
+        return "OK", [(b"x", MESSAGES.get(uid, RAW))]
 
     def logout(self): pass
 
@@ -92,7 +104,7 @@ assert ("select", '"' + server.mutf7_encode("חשבוניות") + '"', True) in 
 server.list_messages("‏חשבוניות ")  # stray RTL mark / whitespace tolerated
 assert ("חשבוניות", set()) == next((n, f - {"\\hasnochildren"}) for n, f in server._list_folders(FakeIMAP(0, 0, server.ssl.create_default_context(), 0)) if n == "חשבוניות")
 
-# ---- drafts ----
+# ---- create_draft ----
 calls.clear()
 r = server.create_draft("דנה <dana@example.co.il>, avi@example.com", "הצעת מחיר", "שלום דנה,\nמצורפת הצעה.", cc="boss@example.com")
 assert r.startswith("Draft saved to 'Draft'"), r
@@ -133,10 +145,111 @@ server.DRAFTS_ENABLED = False
 assert "disabled" in server.create_draft("x@y.com", "s", "b")
 server.DRAFTS_ENABLED = True
 
+# ---- SPECIAL-USE detection (RFC 6154), Hebrew-named Drafts folder ----
+CAPS = ("IMAP4REV1", "SPECIAL-USE")
+LIST_SPECIAL_USE = [
+    b'(\\HasNoChildren) "/" "Inbox"',
+    b'(\\HasNoChildren \\Drafts) "/" "' + server.mutf7_encode("טיוטות").encode() + b'"',
+]
+calls.clear()
+assert server.create_draft("x@y.com", "s", "b").startswith("Draft saved to 'טיוטות'")
+assert ("cmd", "LIST", '""', '"*"', "RETURN", "(SPECIAL-USE)") in calls
+assert [c[1] for c in calls if c[0] == "append"] == ['"' + server.mutf7_encode("טיוטות") + '"']
+# SPECIAL-USE advertised but extended LIST has no \Drafts: fall back to plain LIST flags
+LIST_SPECIAL_USE = [b'(\\HasNoChildren) "/" "Inbox"']
+assert server.create_draft("x@y.com", "s", "b").startswith("Draft saved to 'Draft'")
+# no \Drafts anywhere: refuse instead of guessing a name
+saved = LIST_RESPONSE[:]
+LIST_RESPONSE[:] = [b'(\\HasNoChildren) "/" "Inbox"', b'(\\HasNoChildren) "/" "Draft"']
+assert "Could not identify the Drafts folder" in server.create_draft("x@y.com", "s", "b")
+# ...unless the env override names an existing folder
+server.DRAFTS_FOLDER_OVERRIDE = "Draft"
+assert server.create_draft("x@y.com", "s", "b").startswith("Draft saved to 'Draft'")
+server.DRAFTS_FOLDER_OVERRIDE = ""
+LIST_RESPONSE[:] = saved
+CAPS = ("IMAP4REV1",)
+
+# ---- create_reply_draft ----
+def b64h(text):
+    return "=?utf-8?B?" + base64.b64encode(text.encode()).decode() + "?="
+
+ORIG = (  # 1 Sep 2026 is a Tuesday
+    f"From: {b64h('דנה כהן')} <dana@example.co.il>\r\n"
+    "To: me@yahoo.com, Avi <avi@example.com>\r\n"
+    "Cc: ME@yahoo.com, boss@example.com, avi@example.com\r\n"
+    f"Subject: {b64h('הצעת מחיר')}\r\n"
+    "Date: Tue, 1 Sep 2026 10:00:00 +0300\r\n"
+    "Message-ID: <orig-2@example.co.il>\r\n"
+    "References: <root-0@example.co.il> <prev-1@example.co.il>\r\n"
+    "Content-Type: text/plain; charset=windows-1255\r\n\r\n"
+).encode() + "שורה ראשונה\nשורה שנייה".encode("cp1255")
+MESSAGES[11] = ORIG
+
+calls.clear()
+r = server.create_reply_draft("חשבוניות", 11, "תודה, מאשרת.")
+assert r.startswith("Draft saved to 'Draft' (to: dana@example.co.il)"), r
+assert ("select", '"' + server.mutf7_encode("חשבוניות") + '"', True) in calls  # original opened read-only
+assert all("PEEK" in c[2][1] for c in calls if c[0] == "uid" and c[1] == "FETCH")
+app = [c for c in calls if c[0] == "append"]
+assert len(app) == 1 and app[0][1] == '"Draft"' and app[0][2] == r"(\Draft \Seen)"
+m = email.message_from_bytes(app[0][3], policy=email.policy.default)
+assert str(m["Subject"]) == "Re: הצעת מחיר"
+assert m["In-Reply-To"] == "<orig-2@example.co.il>"
+
+assert str(m["References"]).split() == ["<root-0@example.co.il>", "<prev-1@example.co.il>", "<orig-2@example.co.il>"]
+assert "dana@example.co.il" in str(m["To"]) and "דנה כהן" in str(m["To"]) and m["Cc"] is None
+text = m.get_content()
+assert text.startswith("תודה, מאשרת.\n\nOn Tue, 01 Sep 2026")
+assert "> שורה ראשונה\n> שורה שנייה" in text
+assert b"=?utf-8?" in app[0][3].split(b"\n\n")[0].lower() or b"=?UTF-8?" in app[0][3]  # encoded headers
+
+# reply_all: original To/Cc go to Cc, minus me (any case) and duplicates
+calls.clear()
+r = server.create_reply_draft("חשבוניות", 11, "ok", reply_all=True)
+m = email.message_from_bytes([c for c in calls if c[0] == "append"][0][3], policy=email.policy.default)
+cc = [a.addr_spec for a in m["Cc"].addresses]
+assert cc == ["avi@example.com", "boss@example.com"], cc
+assert "me@yahoo.com" not in str(m["To"]).lower()
+
+# Reply-To wins; existing "Re:" not doubled; no Message-ID -> no threading headers
+MESSAGES[12] = (b"From: a@b.com\r\nReply-To: list@b.com\r\nSubject: RE: hello\r\n\r\nhi")
+calls.clear()
+assert "to: list@b.com" in server.create_reply_draft("Receipts", 12, "x")
+m = email.message_from_bytes([c for c in calls if c[0] == "append"][0][3], policy=email.policy.default)
+assert str(m["Subject"]) == "RE: hello" and m["In-Reply-To"] is None and m["References"] is None
+
+# hostile original: CRLF hidden in an encoded display name must not create headers
+MESSAGES[13] = (f"From: {b64h('x' + chr(13) + chr(10) + 'Bcc: evil@z.com')} <a@b.com>\r\n"
+                f"Subject: {b64h('s' + chr(10) + 'Bcc: evil@z.com')}\r\nMessage-ID: <bad id@x>\r\n\r\nhi").encode()
+calls.clear()
+assert server.create_reply_draft("Receipts", 13, "x").startswith("Draft saved")
+raw_draft = [c for c in calls if c[0] == "append"][0][3]
+m = email.message_from_bytes(raw_draft, policy=email.policy.default)
+assert m["Bcc"] is None and b"\nBcc:" not in raw_draft and m["In-Reply-To"] is None
+assert "a@b.com" in str(m["To"])  # still repliable: raw address kept, broken name dropped
+assert b"Content-Transfer-Encoding: base64" in raw_draft and max(raw_draft) < 128  # 7-bit clean
+
+# no valid sender -> refuse; disallowed folder / bad uid -> refuse; nothing appended
+MESSAGES[14] = b"From: nobody\r\nSubject: s\r\n\r\nhi"
+for args in [("Receipts", 14, "x"), ("Inbox", 11, "x"), ("Draft", 11, "x"), ("Receipts", 0, "x")]:
+    calls.clear()
+    assert server.create_reply_draft(*args).startswith("Error"), args
+    assert not any(c[0] == "append" for c in calls)
+server.DRAFTS_ENABLED = False
+calls.clear()
+assert "disabled" in server.create_reply_draft("Receipts", 11, "x") and not calls  # no IMAP at all
+server.DRAFTS_ENABLED = True
+
+# the only write anywhere in the test run was APPEND; reads always EXAMINE
+assert not any(c[0] == "select" and c[2] is not True for c in calls)
+
 # ---- tool surface ----
 tools = asyncio.run(server.mcp.list_tools())
 names = sorted(t.name for t in tools)
-assert names == ["create_draft", "get_message", "list_allowed_folders", "list_messages", "search_messages"], names
-assert "list_allowed_folders first" in (server.mcp.instructions or "")
+assert names == ["create_draft", "create_reply_draft", "get_message", "list_allowed_folders",
+                 "list_messages", "search_messages"], names
+instr = server.mcp.instructions or ""
+assert "list_allowed_folders first" in instr and "CANNOT send" in instr and "untrusted" in instr
+assert "Never create a draft" in instr
 print({t.name: list(t.input_schema.get("properties", {})) for t in tools})
 print("ALL TESTS PASSED")
