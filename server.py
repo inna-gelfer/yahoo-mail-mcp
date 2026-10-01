@@ -544,7 +544,7 @@ def _append_draft(conn: imaplib.IMAP4_SSL, msg: EmailMessage) -> str:
     """The single write operation of this server: APPEND to the Drafts folder."""
     folder = _drafts_folder(conn)
     typ, _ = conn.append(
-        _imap_mailbox(folder), r"(\Draft \Seen)", imaplib.Time2Internaldate(time.time()), msg.as_bytes()
+        _imap_mailbox(folder), r"(\Draft)", imaplib.Time2Internaldate(time.time()), msg.as_bytes()
     )
     if typ != "OK":
         raise RuntimeError("APPEND failed")

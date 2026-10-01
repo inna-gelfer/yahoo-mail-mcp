@@ -109,7 +109,7 @@ calls.clear()
 r = server.create_draft("דנה <dana@example.co.il>, avi@example.com", "הצעת מחיר", "שלום דנה,\nמצורפת הצעה.", cc="boss@example.com")
 assert r.startswith("Draft saved to 'Draft'"), r
 app = [c for c in calls if c[0] == "append"]
-assert len(app) == 1 and app[0][1] == '"Draft"' and app[0][2] == r"(\Draft \Seen)"
+assert len(app) == 1 and app[0][1] == '"Draft"' and app[0][2] == r"(\Draft)"
 assert not any(c[0] == "select" for c in calls)  # draft path never opens a folder for reading
 m = email.message_from_bytes(app[0][3], policy=email.policy.default)
 assert str(m["Subject"]) == "הצעת מחיר" and m.get_content().startswith("שלום דנה")
@@ -191,7 +191,7 @@ assert r.startswith("Draft saved to 'Draft' (to: dana@example.co.il)"), r
 assert ("select", '"' + server.mutf7_encode("חשבוניות") + '"', True) in calls  # original opened read-only
 assert all("PEEK" in c[2][1] for c in calls if c[0] == "uid" and c[1] == "FETCH")
 app = [c for c in calls if c[0] == "append"]
-assert len(app) == 1 and app[0][1] == '"Draft"' and app[0][2] == r"(\Draft \Seen)"
+assert len(app) == 1 and app[0][1] == '"Draft"' and app[0][2] == r"(\Draft)"
 m = email.message_from_bytes(app[0][3], policy=email.policy.default)
 assert str(m["Subject"]) == "Re: הצעת מחיר"
 assert m["In-Reply-To"] == "<orig-2@example.co.il>"
